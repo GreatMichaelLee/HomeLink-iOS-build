@@ -1,0 +1,86 @@
+# The only file of the public GreatMichaelLee/HomeLink-iOS-build repository
+# (a public repository builds on GitHub's macOS runners for free); kept here,
+# next to what it builds. The source stays private: it is checked out from
+# GreatMichaelLee/n2n with a read-only deploy key, and nothing readable leaves
+# the runner -- the build log and the IPA are uploaded encrypted with
+# ARTIFACT_KEY (scripts/release/build.sh ios decrypts them on the build box).
+# Started only by hand (workflow_dispatch needs write access to this repository).
+name: HomeLink iOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: commit of GreatMichaelLee/n2n to build
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios
+  cancel-in-progress: false
+
+jobs:
+  ipa:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Check out the source (private)
+        uses: actions/checkout@v4
+        with:
+          repository: GreatMichaelLee/n2n
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.N2N_DEPLOY_KEY }}
+          fetch-depth: 0   # the build number is the commit count
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+          add-job-summary: never
+
+      - name: Kotlin/Native cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('mobile/ios/build.gradle.kts') }}
+
+      - name: Tools
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.6.app/Contents/Developer
+          brew install xcodegen >/dev/null
+
+      # compiler messages quote source lines: all output goes to the encrypted log only
+      - name: Build
+        run: |
+          set +e
+          mobile/ios/build.sh > "$RUNNER_TEMP/build.log" 2>&1
+          echo "rc=$?" >> "$RUNNER_TEMP/build.log"
+          grep -q '^rc=0$' "$RUNNER_TEMP/build.log" && echo "build ok" || echo "build failed (see the encrypted log)"
+
+      - name: Encrypt
+        if: always()
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+        run: |
+          OPENSSL="$(brew --prefix openssl@3)/bin/openssl"
+          mkdir -p "$RUNNER_TEMP/out"
+          enc() { "$OPENSSL" enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:ARTIFACT_KEY -in "$1" -out "$RUNNER_TEMP/out/$(basename "$1").enc"; }
+          [ -f "$RUNNER_TEMP/build.log" ] && enc "$RUNNER_TEMP/build.log"
+          for f in mobile/ios/build/ipa/*.ipa mobile/ios/build/ipa/*.sha256; do [ -f "$f" ] && enc "$f"; done
+          ls -l "$RUNNER_TEMP/out"
+          # the job fails when there is no IPA, after the log is safely encrypted
+          ls mobile/ios/build/ipa/*.ipa >/dev/null 2>&1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: homelink-ios-encrypted
+          path: ${{ runner.temp }}/out/
+          retention-days: 3
